@@ -4,7 +4,7 @@ import json
 from collections import namedtuple
 from typing import Awaitable, List, Optional, cast
 
-import websockets
+import aiohttp
 from discord.backoff import ExponentialBackoff
 
 from . import log, socket_log
@@ -12,10 +12,9 @@ from .enums import *
 from .player_manager import PlayerManager
 from .rest_api import Track
 
-__all__ = ["Stats", "Node", "get_node", "join_voice"]
+__all__ = ["Stats", "Node", "NodeStats", "get_node", "get_nodes_stats", "join_voice"]
 
 _nodes = []  # type: List[Node]
-
 
 PlayerState = namedtuple("PlayerState", "position time")
 MemoryInfo = namedtuple("MemoryInfo", "reservable used free allocated")
@@ -29,6 +28,33 @@ class Stats:
         self.active_players = active_players
         self.cpu_info = CPUInfo(**cpu)
         self.uptime = uptime
+
+
+# Node stats related class below and how it is called is originally from:
+# https://github.com/PythonistaGuild/Wavelink/blob/master/wavelink/stats.py#L41
+# https://github.com/PythonistaGuild/Wavelink/blob/master/wavelink/websocket.py#L132
+class NodeStats:
+    def __init__(self, data: dict):
+        self.uptime = data["uptime"]
+
+        self.players = data["players"]
+        self.playing_players = data["playingPlayers"]
+
+        memory = data["memory"]
+        self.memory_free = memory["free"]
+        self.memory_used = memory["used"]
+        self.memory_allocated = memory["allocated"]
+        self.memory_reservable = memory["reservable"]
+
+        cpu = data["cpu"]
+        self.cpu_cores = cpu["cores"]
+        self.system_load = cpu["systemLoad"]
+        self.lavalink_load = cpu["lavalinkLoad"]
+
+        frame_stats = data.get("frameStats", {})
+        self.frames_sent = frame_stats.get("sent", -1)
+        self.frames_nulled = frame_stats.get("nulled", -1)
+        self.frames_deficit = frame_stats.get("deficit", -1)
 
 
 class Node:
@@ -77,6 +103,7 @@ class Node:
 
         self._ws = None
         self._listener_task = None
+        self.session = aiohttp.ClientSession()
 
         self._queue = []
 
@@ -84,6 +111,8 @@ class Node:
         self._state_handlers = []
 
         self.player_manager = PlayerManager(self)
+
+        self.stats = None
 
         if self not in _nodes:
             _nodes.append(self)
@@ -114,10 +143,9 @@ class Node:
         )
 
         tasks = tuple({self._multi_try_connect(u) for u in (combo_uri, uri)})
-
         for task in asyncio.as_completed(tasks, timeout=timeout):
             with contextlib.suppress(Exception):
-                if await cast(Awaitable[Optional[websockets.WebSocketClientProtocol]], task):
+                if await cast(Awaitable[Optional[aiohttp.ClientWebSocketResponse]], task):
                     break
         else:
             raise asyncio.TimeoutError
@@ -136,7 +164,7 @@ class Node:
 
     @staticmethod
     def _get_connect_headers(password, user_id, num_shards):
-        return {"Authorization": password, "User-Id": user_id, "Num-Shards": num_shards}
+        return {"Authorization": password, "User-Id": str(user_id), "Num-Shards": str(num_shards)}
 
     @property
     def lavalink_major_version(self):
@@ -148,31 +176,47 @@ class Node:
         backoff = ExponentialBackoff()
         attempt = 1
 
-        while self._is_shutdown is False and (self._ws is None or not self._ws.open):
+        while self._is_shutdown is False and (self._ws is None or self._ws.closed):
             try:
-                ws = self._ws = await websockets.connect(uri, extra_headers=self.headers)
-                return ws
+                ws = await self.session.ws_connect(url=uri, headers=self.headers)
             except OSError:
                 delay = backoff.delay()
                 log.debug("Failed connect attempt %s, retrying in %s", attempt, delay)
                 await asyncio.sleep(delay)
                 attempt += 1
-            except websockets.InvalidStatusCode:
+            except aiohttp.WSServerHandshakeError:
                 return None
+            else:
+                self._ws = ws
+                return self._ws
 
     async def listener(self):
         """
         Listener task for receiving ops from Lavalink.
         """
-        while self._ws.open and self._is_shutdown is False:
-            try:
-                data = json.loads(await self._ws.recv())
-            except websockets.ConnectionClosed:
+        while self._is_shutdown is False and not self._ws.closed:
+            msg = await self._ws.receive()
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                if msg.type is aiohttp.WSMsgType.ERROR:
+                    log.debug("Ignoring exception in listener task", exc_info=msg.data)
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.CLOSE,
+                ):
+                    log.debug("Listener closing: %s", msg.extra)
+                else:
+                    log.debug(
+                        "WebSocket connection received unexpected message: %s:%s",
+                        msg.type,
+                        msg.data,
+                    )
+
                 break
 
-            raw_op = data.get("op")
+            data = json.loads(msg.data)
             try:
-                op = LavalinkIncomingOp(raw_op)
+                op = LavalinkIncomingOp(data.get("op"))
             except ValueError:
                 socket_log.debug("Received unknown op: %s", data)
             else:
@@ -180,7 +224,7 @@ class Node:
                 self.loop.create_task(self._handle_op(op, data))
 
         self.ready.clear()
-        log.debug("Listener exited: ws %s SHUTDOWN %s.", self._ws.open, self._is_shutdown)
+        log.debug("Listener exited: ws %s SHUTDOWN %s.", not self._ws.closed, self._is_shutdown)
         self.loop.create_task(self._reconnect())
 
     async def _handle_op(self, op: LavalinkIncomingOp, data):
@@ -202,6 +246,7 @@ class Node:
                 cpu=data.get("cpu"),
                 uptime=data.get("uptime"),
             )
+            self.stats = NodeStats(data)
             self.event_handler(op, stats, data)
 
     async def _reconnect(self):
@@ -263,11 +308,13 @@ class Node:
 
         await self.player_manager.disconnect()
 
-        if self._ws is not None and self._ws.open:
+        if self._ws is not None and not self._ws.closed:
             await self._ws.close()
 
         if self._listener_task is not None and not self.loop.is_closed():
             self._listener_task.cancel()
+
+        await self.session.close()
 
         self._state_handlers = []
 
@@ -275,11 +322,11 @@ class Node:
         log.debug("Shutdown Lavalink WS.")
 
     async def send(self, data):
-        if self._ws is None or not self._ws.open:
+        if self._ws is None or self._ws.closed:
             self._queue.append(data)
         else:
             log.debug("Sending data to Lavalink: %s", data)
-            await self._ws.send(json.dumps(data))
+            await self._ws.send_json(data)
 
     async def send_lavalink_voice_update(self, guild_id, session_id, event):
         await self.send(
@@ -308,11 +355,6 @@ class Node:
                 "guildId": str(guild_id),
                 "track": track.track_identifier,
             }
-        )
-        self.event_handler(
-            LavalinkIncomingOp.EVENT,
-            LavalinkEvents.TRACK_START,
-            {"guildId": str(guild_id), "track": track},
         )
 
     async def pause(self, guild_id, paused):
@@ -367,6 +409,10 @@ def get_node(guild_id: int, ignore_ready_status: bool = False) -> Node:
     return least_used
 
 
+def get_nodes_stats():
+    return [node.stats for node in _nodes]
+
+
 async def join_voice(guild_id: int, channel_id: int):
     """
     Joins a voice channel by ID's.
@@ -382,7 +428,7 @@ async def join_voice(guild_id: int, channel_id: int):
 
 
 async def disconnect():
-    for node in _nodes:
+    for node in _nodes.copy():
         await node.disconnect()
 
 
